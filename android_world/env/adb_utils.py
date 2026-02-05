@@ -17,6 +17,8 @@
 import json
 import os
 import re
+import sqlite3
+import tempfile
 import time
 from typing import Any, Callable, Collection, Iterable, Literal, Optional, TypeVar
 import unicodedata
@@ -678,6 +680,71 @@ def _launch_default_app(
   return response
 
 
+def _get_launcher_activity(
+    package_name: str,
+    env: env_interface.AndroidEnvInterface,
+    timeout_sec: float = _DEFAULT_TIMEOUT_SECS,
+) -> Optional[str]:
+  """Get the launcher activity for a package.
+
+  Args:
+    package_name: The package name to query.
+    env: The environment.
+    timeout_sec: A timeout to use for this operation.
+
+  Returns:
+    The full activity name (e.g. 'com.example.app/.MainActivity') or None.
+  """
+  response = issue_generic_request(
+      ['shell', 'cmd', 'package', 'resolve-activity', '--brief',
+       '-c', 'android.intent.category.LAUNCHER', package_name],
+      env, timeout_sec
+  )
+  if response.status != adb_pb2.AdbResponse.Status.OK:
+    return None
+  output = response.generic.output.decode('utf-8').strip()
+  # Output format:
+  # priority=0 preferredOrder=0 match=0x108000 specificIndex=-1 isDefault=true
+  # com.example.app/.MainActivity
+  lines = output.split('\n')
+  if len(lines) >= 2:
+    activity = lines[-1].strip()
+    if '/' in activity:  # Valid activity format
+      return activity
+  return None
+
+
+def launch_app_by_package(
+    package_name: str,
+    env: env_interface.AndroidEnvInterface,
+    timeout_sec: float = _DEFAULT_TIMEOUT_SECS,
+) -> adb_pb2.AdbResponse:
+  """Launch an app by package name using am start instead of monkey.
+
+  This avoids the known monkey bug that enables auto-rotation.
+  See: https://issuetracker.google.com/issues/313495187
+
+  Args:
+    package_name: The package name to launch.
+    env: The environment.
+    timeout_sec: A timeout to use for this operation.
+
+  Returns:
+    The adb response received after issuing the request.
+  """
+  activity = _get_launcher_activity(package_name, env, timeout_sec)
+  if activity:
+    return start_activity(activity, extra_args=[], env=env, timeout_sec=timeout_sec)
+
+  # Fallback: try am start with just the package
+  logging.warning('Could not resolve launcher activity for %s, using fallback', package_name)
+  return issue_generic_request(
+      ['shell', 'am', 'start', '-a', 'android.intent.action.MAIN',
+       '-c', 'android.intent.category.LAUNCHER', package_name],
+      env, timeout_sec
+  )
+
+
 def launch_app(
     app_name: str,
     env: env_interface.AndroidEnvInterface,
@@ -699,10 +766,10 @@ def launch_app(
 
   activity = get_adb_activity(app_name)
   if activity is None:
-    #  If the app name is not in the mapping, assume it is a package name.
-    response = issue_generic_request(
-        ['shell', 'monkey', '-p', app_name, '1'], env, timeout_sec=5
-    )
+    # If the app name is not in the mapping, assume it is a package name.
+    # Use launch_app_by_package instead of monkey to avoid auto-rotation bug.
+    # See: https://issuetracker.google.com/issues/313495187
+    response = launch_app_by_package(app_name, env, timeout_sec=5)
     logging.info('Launching app by package name, response: %r', response)
     return app_name
   start_activity(activity, extra_args=[], env=env, timeout_sec=5)
