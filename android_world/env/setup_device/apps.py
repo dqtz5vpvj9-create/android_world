@@ -83,12 +83,73 @@ class AppSetup(abc.ABC):
 
   @classmethod
   def setup(cls, env: interface.AsyncEnv) -> None:
-    """Performs setup tasks specific to the app."""
-    adb_utils.clear_app_data(
-        adb_utils.extract_package_name(
-            adb_utils.get_adb_activity(cls.app_name)
-        ),
-        env.controller,
+    """Performs setup tasks specific to the app.
+
+    Clears app data and then re-grants all runtime permissions that were
+    revoked by ``pm clear``.
+    """
+    package = adb_utils.extract_package_name(
+        adb_utils.get_adb_activity(cls.app_name)
+    )
+    adb_utils.clear_app_data(package, env.controller)
+
+    # pm clear revokes every runtime permission.  Re-grant them so that
+    # subclass setup() code (and later task execution) doesn't hit
+    # permission dialogs.
+    cls._grant_all_runtime_permissions(package, env)
+
+  @classmethod
+  def _grant_all_runtime_permissions(
+      cls,
+      package: str,
+      env: interface.AsyncEnv,
+  ) -> None:
+    """Grants all requested runtime (dangerous) permissions for *package*.
+
+    Parses ``dumpsys package`` to discover every permission the app
+    declared under ``requested permissions:``, then calls ``pm grant``
+    for each one.  Non-runtime permissions will silently fail — that is
+    expected and harmless.
+    """
+    try:
+      resp = adb_utils.issue_generic_request(
+          ['shell', 'dumpsys', 'package', package], env.controller
+      )
+      output = (resp.generic.output or b'').decode('utf-8', errors='replace')
+    except Exception as e:  # pylint: disable=broad-except
+      logging.warning('Failed to query permissions for %s: %s', package, e)
+      return
+
+    # ── parse requested permissions section ──
+    permissions: list[str] = []
+    in_requested = False
+    for line in output.splitlines():
+      stripped = line.strip()
+      if stripped.startswith('requested permissions:'):
+        in_requested = True
+        continue
+      if in_requested:
+        if stripped.startswith('android.permission.') or stripped.startswith('com.'):
+          permissions.append(stripped)
+        elif stripped and ':' in stripped:
+          break  # next section header
+
+    if not permissions:
+      return
+
+    granted = 0
+    for perm in permissions:
+      try:
+        adb_utils.issue_generic_request(
+            ['shell', 'pm', 'grant', package, perm], env.controller
+        )
+        granted += 1
+      except Exception:  # pylint: disable=broad-except
+        pass  # non-runtime permissions fail here; that's fine
+
+    logging.info(
+        '%s: re-granted %d/%d permissions after pm clear',
+        package, granted, len(permissions),
     )
 
   @classmethod
@@ -149,8 +210,17 @@ class CameraApp(AppSetup):
 
 
 class ChromeApp(AppSetup):
-  """Class for setting up pre-installed Chrome app."""
+  """Class for setting up Chrome app.
 
+  Originally assumed pre-installed, but Cuttlefish (CVD) emulators lack GMS
+  and therefore do not ship Chrome.  We provide APKs for both arm64 and
+  x86_64 architectures so setup_app_native can install the correct one.
+  """
+
+  apk_names = (
+      "com.android.chrome_arm64.apk",
+      "com.android.chrome_x86_64.apk",
+  )
   app_name = "chrome"
 
   @classmethod
@@ -162,22 +232,50 @@ class ChromeApp(AppSetup):
     try:
       controller = tools.AndroidToolController(env=env.controller)
       time.sleep(2.0)
+      # "Chrome won't run without Google Play services" — CVD has no GMS.
+      try:
+        controller.click_element("OK")
+        time.sleep(2.0)
+      except ValueError:
+        logging.info("ChromeApp: 'OK' (Play services warning) not found — skipping.")
       # Welcome screen.
-      controller.click_element("Accept & continue")
-      time.sleep(2.0)
+      try:
+        controller.click_element("Accept & continue")
+        time.sleep(2.0)
+      except ValueError:
+        logging.info("ChromeApp: 'Accept & continue' not found — may be dismissed.")
       # Turn on sync?
-      controller.click_element("No thanks")
-      time.sleep(2.0)
+      try:
+        controller.click_element("No thanks")
+        time.sleep(2.0)
+      except ValueError:
+        logging.info("ChromeApp: 'No thanks' (sync) not found — skipping.")
       # Enable notifications?
-      controller.click_element("No thanks")
-      time.sleep(2.0)
+      try:
+        controller.click_element("No thanks")
+        time.sleep(2.0)
+      except ValueError:
+        logging.info("ChromeApp: 'No thanks' (notifications) not found — skipping.")
+      # "Search with Sogou" — locale-dependent search engine prompt.
+      try:
+        controller.click_element("Keep Google")
+        time.sleep(2.0)
+      except ValueError:
+        logging.info("ChromeApp: 'Keep Google' (search engine) not found — skipping.")
     finally:
       adb_utils.close_app(cls.app_name, env.controller)
 
 
 class ClockApp(AppSetup):
-  """Class for setting up pre-installed Clock app."""
+  """Class for setting up Clock app.
 
+  On physical devices without GMS, the pre-installed Clock may be a different
+  version. Use the APK extracted from the official Pixel 6 Tiramisu AVD to
+  ensure UI elements match the expected layout (e.g. "Pause" button instead
+  of "Stop" in newer versions).
+  """
+
+  apk_names = ("PrebuiltDeskClockGoogle.apk",)
   app_name = "clock"
 
   @classmethod
@@ -191,8 +289,12 @@ class ClockApp(AppSetup):
 
 
 class ContactsApp(AppSetup):
-  """Class for setting up pre-installed Contacts app."""
+  """Class for setting up Contacts app.
 
+  Uses the Google Contacts APK from the official Pixel 6 Tiramisu AVD.
+  """
+
+  apk_names = ("GoogleContacts.apk",)
   app_name = "contacts"
 
   @classmethod
@@ -205,18 +307,36 @@ class ContactsApp(AppSetup):
       controller = tools.AndroidToolController(env=env.controller)
       time.sleep(2.0)
       # Back up & organize your contacts with Google.
-      controller.click_element("Skip")
-      time.sleep(2.0)
+      try:
+        controller.click_element("Skip")
+        time.sleep(2.0)
+      except ValueError:
+        logging.info("ContactsApp: 'Skip' not found — may already be dismissed.")
       # Allow Contacts to send you notifications?
-      controller.click_element("Don't allow")
-      time.sleep(2.0)
+      # If POST_NOTIFICATIONS was already granted, this dialog won't appear.
+      try:
+        controller.click_element("Don't allow")
+        time.sleep(2.0)
+      except ValueError:
+        logging.info(
+            "ContactsApp: 'Don't allow' not found — notification permission"
+            " likely already granted."
+        )
     finally:
       adb_utils.close_app(cls.app_name, env.controller)
 
 
 class DialerApp(AppSetup):
-  """Class for setting up pre-installed Dialer app."""
+  """Class for setting up Dialer app.
 
+  Uses the Google Dialer APK from the official Pixel 6 Tiramisu AVD.
+  arm64 variant for physical devices, x86_64 for emulators.
+  """
+
+  apk_names = (
+      "GoogleDialer_arm64.apk",    # arm64-v8a for physical devices
+      "GoogleDialer_x86_64.apk",   # x86_64 from AVD, for emulators
+  )
   app_name = "dialer"
 
 
@@ -246,21 +366,44 @@ class MarkorApp(AppSetup):
     try:
       controller = tools.AndroidToolController(env=env.controller)
       time.sleep(2.0)
-      controller.click_element("NEXT")
-      time.sleep(2.0)
-      controller.click_element("NEXT")
-      time.sleep(2.0)
-      controller.click_element("NEXT")
-      time.sleep(2.0)
-      controller.click_element("NEXT")
-      time.sleep(2.0)
-      controller.click_element("DONE")
+
+      # Onboarding wizard: navigate through pages until DONE appears.
+      # Normally 4 NEXT presses, but UI page-transition animations may
+      # swallow a click, so we keep pressing NEXT until it disappears
+      # rather than relying on an exact count.
+      max_next = 8  # safety cap (normally 4)
+      for _ in range(max_next):
+        try:
+          controller.click_element("NEXT")
+          time.sleep(2.0)
+        except ValueError:
+          # NEXT no longer on screen → should be on final DONE page
+          break
+
+      # Click DONE; if it fails, maybe one more NEXT was needed.
+      try:
+        controller.click_element("DONE")
+      except ValueError:
+        # Retry: click NEXT once more, then DONE
+        controller.click_element("NEXT")
+        time.sleep(2.0)
+        controller.click_element("DONE")
       time.sleep(2.0)
 
-      controller.click_element("OK")
-      time.sleep(2.0)
-      controller.click_element("Allow access to manage all files")
-      time.sleep(2.0)
+      # Permission dialogs — may not appear if already granted.
+      try:
+        controller.click_element("OK")
+        time.sleep(2.0)
+      except ValueError:
+        logging.info("MarkorApp: 'OK' not found — permission already granted.")
+      try:
+        controller.click_element("Allow access to manage all files")
+        time.sleep(2.0)
+      except ValueError:
+        logging.info(
+            "MarkorApp: 'Allow access to manage all files' not found"
+            " — permission already granted."
+        )
     finally:
       adb_utils.close_app(cls.app_name, env.controller)
 
@@ -307,9 +450,17 @@ class ClipperApp(AppSetup):
     adb_utils.launch_app(cls.app_name, env.controller)
     try:
       time.sleep(2.0)
-      controller.click_element("Continue")
-      time.sleep(2.0)
-      controller.click_element("OK")
+      # Onboarding dialogs — may not appear in all versions.
+      try:
+        controller.click_element("Continue")
+        time.sleep(2.0)
+      except ValueError:
+        logging.info("ClipperApp: 'Continue' not found — skipping.")
+      try:
+        controller.click_element("OK")
+        time.sleep(2.0)
+      except ValueError:
+        logging.info("ClipperApp: 'OK' not found — skipping.")
     finally:
       adb_utils.close_app(cls.app_name, env.controller)
 
@@ -396,9 +547,22 @@ class SimpleGalleryProApp(AppSetup):
     try:
       controller = tools.AndroidToolController(env=env.controller)
       time.sleep(2.0)
-      controller.click_element("All files")
-      time.sleep(2.0)
-      controller.click_element("Allow access to manage all files")
+      # Permission dialogs — may not appear if already granted.
+      try:
+        controller.click_element("All files")
+        time.sleep(2.0)
+      except ValueError:
+        logging.info(
+            "SimpleGalleryProApp: 'All files' not found"
+            " — permission already granted."
+        )
+      try:
+        controller.click_element("Allow access to manage all files")
+      except ValueError:
+        logging.info(
+            "SimpleGalleryProApp: 'Allow access to manage all files'"
+            " not found — permission already granted."
+        )
     finally:
       adb_utils.close_app(cls.app_name, env.controller)
 
@@ -426,9 +590,22 @@ class SimpleSMSMessengerApp(AppSetup):
     try:
       controller = tools.AndroidToolController(env=env.controller)
       time.sleep(2.0)
-      controller.click_element("SMS Messenger")
-      time.sleep(2.0)
-      controller.click_element("Set as default")
+      # Default-app confirmation — may not appear if already set.
+      try:
+        controller.click_element("SMS Messenger")
+        time.sleep(2.0)
+      except ValueError:
+        logging.info(
+            "SimpleSMSMessengerApp: 'SMS Messenger' not found"
+            " — may already be default."
+        )
+      try:
+        controller.click_element("Set as default")
+      except ValueError:
+        logging.info(
+            "SimpleSMSMessengerApp: 'Set as default' not found"
+            " — may already be default."
+        )
     finally:
       adb_utils.close_app(cls.app_name, env.controller)
 
@@ -633,7 +810,13 @@ class OpenTracksApp(AppSetup):
     time.sleep(2.0)
     controller = tools.AndroidToolController(env=env.controller)
     # Give permission for bluetooth, can't be done through adb.
-    controller.click_element("Allow")
+    try:
+      controller.click_element("Allow")
+    except ValueError:
+      logging.info(
+          "OpenTracksApp: 'Allow' not found"
+          " — bluetooth permission may already be granted."
+      )
     adb_utils.launch_app("activity tracker", env.controller)
     adb_utils.close_app("activity tracker", env.controller)
 
@@ -678,13 +861,38 @@ class VlcApp(AppSetup):
     time.sleep(2.0)
     try:
       controller = tools.AndroidToolController(env=env.controller)
-      controller.click_element("Skip")
-      time.sleep(2.0)
-      controller.click_element("GRANT PERMISSION")
-      time.sleep(2.0)
-      controller.click_element("OK")
-      time.sleep(2.0)
-      controller.click_element("Allow access to manage all files")
+      try:
+        controller.click_element("Skip")
+        time.sleep(2.0)
+      except ValueError:
+        logging.info("VlcApp: 'Skip' not found — onboarding may be done.")
+      # Permission dialogs — may not appear if already granted.
+      try:
+        controller.click_element("GRANT PERMISSION")
+        time.sleep(2.0)
+      except ValueError:
+        logging.info("VlcApp: 'GRANT PERMISSION' not found — already granted.")
+      try:
+        controller.click_element("OK")
+        time.sleep(2.0)
+      except ValueError:
+        logging.info("VlcApp: 'OK' not found — permission already granted.")
+      try:
+        controller.click_element("Allow access to manage all files")
+      except ValueError:
+        logging.info(
+            "VlcApp: 'Allow access to manage all files' not found"
+            " — permission already granted."
+        )
+      # "New external storage detected" dialog — click YES to add
+      # Virtual SD card to medialibrary.
+      try:
+        controller.click_element("YES")
+        time.sleep(2.0)
+      except ValueError:
+        logging.info(
+            "VlcApp: 'YES' (external storage dialog) not found — skipping."
+        )
     finally:
       adb_utils.close_app(cls.app_name, env.controller)
 

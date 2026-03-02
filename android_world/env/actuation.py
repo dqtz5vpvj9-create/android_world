@@ -262,6 +262,7 @@ def _wait_and_find_click_element(
   while current - start < 10:
     if distance <= dist_threshold:
       return json_action.JSONAction(action_type='click', index=element)
+    time.sleep(0.1)  # avoid tight-loop hammering get_ui_elements
     ui_elements = env.get_ui_elements()
     element, distance = _find_target_element(
         ui_elements, target_text, case_sensitive

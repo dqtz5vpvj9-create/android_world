@@ -16,10 +16,12 @@
 
 import abc
 import dataclasses
+import time
 from typing import Any
 from typing import Optional
 from typing import Type
 from absl import logging
+from android_world.env import adb_utils
 from android_world.env import interface
 from android_world.task_evals import task_eval
 from android_world.task_evals.utils import sqlite_schema_utils
@@ -222,7 +224,8 @@ class SQLiteApp(task_eval.TaskEval, abc.ABC):
         in the database.
     """
     return sqlite_utils.get_rows_from_remote_device(
-        self.table_name, self.db_path, self.row_type, env, timeout_sec
+        self.table_name, self.db_path, self.row_type, env, timeout_sec,
+        app_name=self.app_name_with_db
     )
 
   def add_rows(
@@ -246,13 +249,24 @@ class SQLiteApp(task_eval.TaskEval, abc.ABC):
     sqlite_utils.delete_all_rows_from_table(
         self.table_name, self.db_path, env, self.app_name_with_db
     )
-    try:
-      self.list_rows(env)
-    except ValueError as e:
-      raise RuntimeError(
-          "After clearing the old SQLite database, a new empty database was"
-          " not created."
-      ) from e
+    # Relaunch app to ensure empty DB is initialized with schema
+    adb_utils.launch_app(self.app_name_with_db, env.controller)
+    time.sleep(3.0)
+    adb_utils.close_app(self.app_name_with_db, env.controller)
+    time.sleep(1.0)
+
+    last_err = None
+    for attempt in range(5):
+      try:
+        time.sleep(2.0)
+        self.list_rows(env)
+        return
+      except ValueError as e:
+        last_err = e
+    raise RuntimeError(
+        "After clearing the old SQLite database, a new empty database was"
+        " not created."
+    ) from last_err
 
   def initialize_task(self, env: interface.AsyncEnv) -> None:
     """Initializes the task environment."""

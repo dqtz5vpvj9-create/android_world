@@ -14,6 +14,7 @@
 
 """Utilties to interact with the environment using adb."""
 
+import base64
 import json
 import os
 import re
@@ -122,7 +123,7 @@ _PATTERN_TO_ACTIVITY = immutabledict.immutabledict({
     'pinterest': 'com.pinterest/com.pinterest.activity.PinterestActivity',
     'android world': 'com.example.androidworld/.MainActivity',
     'files': (
-        'com.google.android.documentsui/com.android.documentsui.files.FilesActivity'
+        'com.android.documentsui/com.android.documentsui.files.FilesActivity'
     ),
     'markor': 'net.gsantner.markor/net.gsantner.markor.activity.MainActivity',
     'clipper': 'ca.zgrs.clipper/ca.zgrs.clipper.Main',
@@ -1195,8 +1196,34 @@ def _extract_clipper_output(raw_output: str) -> str:
     )
 
 
+def _extract_content_call_result(raw_output: str) -> str:
+  """Parses the result from an adb 'content call' command.
+
+  The output format is: Result: Bundle[{result=value}]
+
+  Args:
+    raw_output: The adb command output.
+
+  Returns:
+    The extracted result string.
+
+  Raises:
+    RuntimeError: If the output cannot be parsed.
+  """
+  match = re.search(r'Bundle\[\{result=(.*?)(?:, error=.*)?\}\]', raw_output)
+  if match:
+    return match.group(1)
+  raise RuntimeError(
+      f'Failed to parse content call output: {raw_output}'
+  )
+
+
 def get_clipboard_contents(env: env_interface.AndroidEnvInterface) -> str:
   """Gets the clipboard content from the Android device.
+
+  On Android 13+, only the focused Activity can read the clipboard.
+  Flow: launch Clipper Activity (reads clipboard on focus) → query
+  ContentProvider for the result.
 
   Args:
     env: The environment.
@@ -1214,16 +1241,20 @@ def get_clipboard_contents(env: env_interface.AndroidEnvInterface) -> str:
         ' need to install clipper app.'
     )
 
-  time.sleep(0.5)
+  # Wait for Activity to gain focus and read clipboard
+  time.sleep(1.0)
+
   res = issue_generic_request(
-      ['shell', 'am', 'broadcast', '-a', 'clipper.get'], env
+      ['shell', 'content', 'call', '--uri', 'content://ca.zgrs.clipper',
+       '--method', 'get'],
+      env,
   )
 
   if res.status != adb_pb2.AdbResponse.Status.OK:
     raise RuntimeError('Failed to get clipboard content.')
 
   output_str = res.generic.output.decode('utf-8')
-  result = _extract_clipper_output(output_str)
+  result = _extract_content_call_result(output_str)
 
   press_back_button(env)
   return result
@@ -1265,9 +1296,7 @@ def set_clipboard_contents(
 ) -> None:
   """Sets the clipboard content on the Android device.
 
-  NOTE: If using an Emulator, the contents of your clipboard on your local
-  machine may transfer to the emulator when focused on the emulator. Thus the
-  result of this function can be overwritten just by switching windows.
+  Uses ContentProvider (content call) which runs in the app process.
 
   Args:
     content: Content to put into clipboard.
@@ -1285,11 +1314,19 @@ def set_clipboard_contents(
 
   time.sleep(0.5)
   content = _adb_text_format(content)
-  output_str = issue_generic_request(
-      ['shell', 'am', 'broadcast', '-a', 'clipper.set', '-e', 'text', content],
+  res = issue_generic_request(
+      ['shell', 'content', 'call', '--uri', 'content://ca.zgrs.clipper',
+       '--method', 'set', '--arg', content],
       env,
-  ).generic.output.decode('utf-8')
-  _extract_clipper_output(output_str)
+  )
+
+  if res.status != adb_pb2.AdbResponse.Status.OK:
+    raise RuntimeError('Failed to set clipboard content.')
+
+  output_str = res.generic.output.decode('utf-8')
+  result = _extract_content_call_result(output_str)
+  if result != 'OK':
+    raise RuntimeError(f'Failed to set clipboard: {result}')
   press_back_button(env)
 
 
@@ -1449,13 +1486,318 @@ def call_phone_number(
   return issue_generic_request(adb_args, env, timeout_sec)
 
 
+def _execute_sql_script(
+    db_path: str,
+    sql_script: str,
+    env: env_interface.AndroidEnvInterface,
+) -> adb_pb2.AdbResponse:
+  """Execute a multi-statement SQL script on a SQLite database via ADB.
+
+  Unlike execute_sql_command which wraps SQL in double quotes on the command
+  line, this helper writes the SQL to a temp file on the device and runs it
+  with `.read`, avoiding shell-escaping issues for complex scripts.
+
+  Args:
+    db_path: The path to the SQLite database on the Android device.
+    sql_script: The SQL script (may contain multiple statements).
+    env: The environment.
+
+  Returns:
+    The adb response received after issuing the request.
+  """
+  set_root_if_needed(env)
+  tmp_sql = '/data/local/tmp/_sms_insert.sql'
+  # Write script to temp file using base64 encoding to safely transport
+  # arbitrary SQL through the shell without escaping issues.
+  encoded = base64.b64encode(sql_script.encode('utf-8')).decode('ascii')
+  write_resp = issue_generic_request(
+      ['shell', f'echo {encoded} | base64 -d > {tmp_sql}'],
+      env,
+  )
+  if write_resp.status != adb_pb2.AdbResponse.Status.OK:
+    logging.error('Failed to write SQL script to device')
+    return write_resp
+
+  # Execute the script
+  response = issue_generic_request(
+      ['shell', f'sqlite3 {db_path} < {tmp_sql}'],
+      env,
+  )
+
+  # Cleanup
+  issue_generic_request(['shell', f'rm -f {tmp_sql}'], env)
+
+  return response
+
+
+def _insert_sms_via_sql(
+    env: env_interface.AndroidEnvInterface,
+    phone_number: str,
+    message: str,
+    sms_type: int = 1,
+    timeout_sec: float = _DEFAULT_TIMEOUT_SECS,
+) -> adb_pb2.AdbResponse:
+  """Insert an SMS directly into mmssms.db via sqlite3 on the device.
+
+  On Android 13+, the SmsProvider silently rejects 'content insert' from any
+  caller that is not the default SMS application (even root/shell).  Direct
+  sqlite3 execution bypasses the ContentProvider and writes the row reliably.
+
+  This function also creates the necessary canonical_addresses and threads
+  rows so that the message is visible in SMS apps that display messages by
+  conversation (e.g. Simple SMS Messenger).  Without these supporting rows
+  the SMS row would have thread_id=0 and be invisible.
+
+  Requires root access on the device.
+
+  Args:
+    env: The Android environment interface.
+    phone_number: The sender's phone number.
+    message: The text message content.
+    sms_type: SMS type (1=inbox/received, 2=sent, 3=draft).
+    timeout_sec: A timeout for the ADB operation.
+
+  Returns:
+    A response object containing the ADB operation result.
+  """
+  _SMS_DB = '/data/data/com.android.providers.telephony/databases/mmssms.db'
+
+  now_ms = int(time.time() * 1000)
+  # SQL-escape single quotes (standard sqlite escaping: ' → '')
+  escaped_body = message.replace("'", "''")
+  escaped_phone = phone_number.replace("'", "''")
+  read_flag = 0 if sms_type == 1 else 1
+  seen_flag = 0 if sms_type == 1 else 1
+
+  # Build a multi-statement SQL script that:
+  # 1. Ensures a canonical_addresses row exists for this phone number
+  #    (no UNIQUE constraint on address, so use WHERE NOT EXISTS)
+  # 2. Ensures a threads row exists for this canonical address
+  #    (no UNIQUE constraint on recipient_ids, so use WHERE NOT EXISTS)
+  # 3. Inserts the SMS with the correct thread_id
+  #    (built-in trigger sms_update_thread_on_insert will auto-update
+  #     threads.message_count, snippet, date, and read)
+  sql_script = f"""
+INSERT INTO canonical_addresses (address)
+  SELECT '{escaped_phone}'
+  WHERE NOT EXISTS (
+    SELECT 1 FROM canonical_addresses WHERE address = '{escaped_phone}'
+  );
+
+INSERT INTO threads (recipient_ids, date, message_count, snippet, read, type)
+  SELECT CAST(ca._id AS TEXT), {now_ms}, 0, '', 1, 0
+  FROM canonical_addresses ca
+  WHERE ca.address = '{escaped_phone}'
+    AND NOT EXISTS (
+      SELECT 1 FROM threads
+      WHERE recipient_ids = CAST(ca._id AS TEXT)
+    );
+
+INSERT INTO sms (thread_id, address, body, type, date, date_sent, read, seen, status)
+  SELECT t._id, '{escaped_phone}', '{escaped_body}', {sms_type},
+         {now_ms}, {now_ms}, {read_flag}, {seen_flag}, -1
+  FROM canonical_addresses ca
+  JOIN threads t ON t.recipient_ids = CAST(ca._id AS TEXT)
+  WHERE ca.address = '{escaped_phone}';
+"""
+
+  response = _execute_sql_script(_SMS_DB, sql_script.strip(), env)
+
+  type_label = {1: 'inbox', 2: 'sent', 3: 'draft'}.get(sms_type, str(sms_type))
+  if response.status == adb_pb2.AdbResponse.Status.OK:
+    logging.info(
+        'SMS inserted via sqlite3 (%s): from=%s, body=%s',
+        type_label, phone_number, message[:50]
+    )
+  else:
+    output = response.generic.output.decode('utf-8', errors='ignore').strip()
+    logging.error(
+        'sqlite3 SMS insert failed (%s): from=%s, output=%s',
+        type_label, phone_number, output[:200]
+    )
+
+  return response
+
+
+def _insert_sms_via_database(
+    env: env_interface.AndroidEnvInterface,
+    phone_number: str,
+    message: str,
+    timeout_sec: float = _DEFAULT_TIMEOUT_SECS,
+) -> adb_pb2.AdbResponse:
+  """Insert an SMS directly into the telephony database (legacy fallback).
+
+  This method pulls mmssms.db to host, modifies it with sqlite3, and pushes
+  it back.  It is fragile because the telephony process may have the DB
+  cached/open.  Prefer _insert_sms_via_sql which runs sqlite3 directly on
+  the device.
+
+  Args:
+    env: The Android environment interface.
+    phone_number: The sender's phone number.
+    message: The text message content.
+    timeout_sec: A timeout for the ADB operation.
+
+  Returns:
+    A response object containing the ADB operation result.
+  """
+  db_path_device = '/data/data/com.android.providers.telephony/databases/mmssms.db'
+  
+  # Create a temporary file for the database
+  with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as tmp_file:
+    tmp_db_path = tmp_file.name
+  
+  try:
+    # Pull the database from the device
+    pull_result = issue_generic_request(
+        ['pull', db_path_device, tmp_db_path], env, timeout_sec
+    )
+    if pull_result.status != adb_pb2.AdbResponse.Status.OK:
+      logging.error('Failed to pull SMS database from device')
+      return pull_result
+    
+    # Open and modify the database with proper exception handling
+    conn = None
+    try:
+      conn = sqlite3.connect(tmp_db_path)
+      cursor = conn.cursor()
+      
+      # Check or create canonical_address
+      cursor.execute(
+          'SELECT _id FROM canonical_addresses WHERE address = ?',
+          (phone_number,)
+      )
+      row = cursor.fetchone()
+      if row:
+        address_id = row[0]
+      else:
+        cursor.execute(
+            'INSERT INTO canonical_addresses (address) VALUES (?)',
+            (phone_number,)
+        )
+        address_id = cursor.lastrowid
+      
+      # Check or create thread
+      cursor.execute(
+          'SELECT _id FROM threads WHERE recipient_ids = ?',
+          (str(address_id),)
+      )
+      row = cursor.fetchone()
+      if row:
+        thread_id = row[0]
+      else:
+        now_ms = int(time.time() * 1000)
+        cursor.execute(
+            'INSERT INTO threads (recipient_ids, date) VALUES (?, ?)',
+            (str(address_id), now_ms)
+        )
+        thread_id = cursor.lastrowid
+      
+      # Insert SMS (type=1 for inbox, read=0 for unread)
+      now_ms = int(time.time() * 1000)
+      cursor.execute(
+          '''INSERT INTO sms (thread_id, address, date, date_sent, type, read, status, body)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+          (thread_id, phone_number, now_ms, now_ms, 1, 0, -1, message)
+      )
+      
+      conn.commit()
+    except sqlite3.Error as e:
+      logging.error('SQLite operation failed: %s', e)
+      if conn:
+        conn.rollback()
+      return adb_pb2.AdbResponse(
+          status=adb_pb2.AdbResponse.Status.INTERNAL_ERROR,
+          generic=adb_pb2.AdbResponse.GenericResponse(
+              output=f'Database modification failed: {e}'.encode('utf-8')
+          )
+      )
+    finally:
+      if conn:
+        conn.close()
+    
+    # Push the modified database back to the device
+    push_result = issue_generic_request(
+        ['push', tmp_db_path, db_path_device], env, timeout_sec
+    )
+    if push_result.status != adb_pb2.AdbResponse.Status.OK:
+      logging.error('Failed to push SMS database to device')
+      return push_result
+    
+    # Fix permissions (radio:radio owns the telephony databases)
+    chown_result = issue_generic_request(
+        ['shell', 'chown', 'radio:radio', db_path_device], env, timeout_sec
+    )
+    if chown_result.status != adb_pb2.AdbResponse.Status.OK:
+      logging.warning('Failed to set database permissions (non-rooted device?)')
+    
+    logging.info('Successfully inserted SMS via database: from=%s, message=%s',
+                 phone_number, message[:50])
+    
+    return push_result
+    
+  finally:
+    # Clean up temporary file
+    try:
+      os.remove(tmp_db_path)
+    except OSError:
+      pass
+
+
+def _is_avd_emulator(
+    env: env_interface.AndroidEnvInterface,
+    timeout_sec: float = _DEFAULT_TIMEOUT_SECS,
+) -> bool:
+  """Check if the device is an AVD (Android Virtual Device) emulator.
+
+  Only AVD emulators support 'adb emu sms send'. CVD (Cuttlefish) and real
+  devices do NOT support this command.
+
+  Args:
+    env: The Android environment interface.
+    timeout_sec: A timeout for the ADB operation.
+
+  Returns:
+    True if the device is an AVD emulator, False otherwise.
+  """
+  # Check ro.hardware for goldfish/ranchu (AVD-specific)
+  response = issue_generic_request(
+      ['shell', 'getprop', 'ro.hardware'], env, timeout_sec
+  )
+  if response.status == adb_pb2.AdbResponse.Status.OK:
+    hardware = response.generic.output.decode('utf-8', errors='ignore').strip().lower()
+    if any(x in hardware for x in ['goldfish', 'ranchu']):
+      return True
+
+  # Check ro.kernel.qemu (set to 1 on AVD emulators)
+  response = issue_generic_request(
+      ['shell', 'getprop', 'ro.kernel.qemu'], env, timeout_sec
+  )
+  if response.status == adb_pb2.AdbResponse.Status.OK:
+    qemu = response.generic.output.decode('utf-8', errors='ignore').strip()
+    if qemu == '1':
+      return True
+
+  return False
+
+
 def text_emulator(
     env: env_interface.AndroidEnvInterface,
     phone_number: str,
     message: str,
     timeout_sec: float = _DEFAULT_TIMEOUT_SECS,
 ) -> adb_pb2.AdbResponse:
-  """Simulate an incoming text message in an emulator using ADB.
+  """Simulate an incoming text message using ADB.
+
+  Strategy:
+    1. AVD emulator → 'adb emu sms send' (triggers full modem notification)
+    2. All other devices (CVD, real devices) → direct sqlite3 insert into
+       mmssms.db, which is immediately visible via 'content query' reads.
+       (Android 13+ SmsProvider silently rejects 'content insert' from
+       non-default-SMS-app callers, so we bypass the ContentProvider.)
+
+  Note: This function is named 'text_emulator' for backward compatibility,
+  but it supports AVD emulators, CVD (Cuttlefish), and rooted real devices.
 
   Args:
     env: The Android environment interface.
@@ -1467,15 +1809,31 @@ def text_emulator(
     A response object containing the ADB operation result.
   """
   escaped_phone_number = re.sub(r'[^0-9+]', '', phone_number)
-  adb_args = [
-      'emu',
-      'sms',
-      'send',
-      f'{escaped_phone_number}',
-      f'{message}',
-  ]
-  response = issue_generic_request(adb_args, env, timeout_sec)
-  return response
+
+  # Only AVD emulators support 'emu sms send'
+  if _is_avd_emulator(env, timeout_sec):
+    logging.info('Device is AVD emulator, using emu sms send')
+    adb_args = [
+        'emu',
+        'sms',
+        'send',
+        f'{escaped_phone_number}',
+        f'{message}',
+    ]
+    return issue_generic_request(adb_args, env, timeout_sec)
+  else:
+    # CVD / real device — direct sqlite3 insert (content provider is broken
+    # on Android 13+ for non-default-SMS-app callers)
+    logging.info('Device is CVD/real device, using sqlite3 for SMS insert')
+    return _insert_sms_via_sql(
+        env, escaped_phone_number, message,
+        sms_type=1,  # inbox (received)
+        timeout_sec=timeout_sec,
+    )
+
+
+# Alias for backward compatibility and semantic clarity
+send_sms = text_emulator
 
 
 def set_default_app(

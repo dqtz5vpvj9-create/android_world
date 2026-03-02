@@ -16,8 +16,8 @@
 
 import datetime
 
-# Screen dimensions of Pixel 6.
-SCREEN_HEIGHT, SCREEN_WIDTH = 2400, 1080
+# Screen dimensions of Pixel 4a.
+SCREEN_HEIGHT, SCREEN_WIDTH = 2340, 1080
 
 # Where data on emulator is stored.
 EMULATOR_DATA = "/storage/emulated/0/"
