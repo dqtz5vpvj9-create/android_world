@@ -630,16 +630,9 @@ class AudioRecorder(AppSetup):
         env.controller,
     )
 
-    # Launch the app
-    adb_utils.issue_generic_request(
-        [
-            "shell",
-            "monkey",
-            "-p",
-            "com.dimowner.audiorecorder",
-            "-candroid.intent.category.LAUNCHER",
-            "1",
-        ],
+    # Launch the app via am start (not monkey) to avoid auto-rotate bug.
+    adb_utils.launch_app_by_package(
+        "com.dimowner.audiorecorder",
         env.controller,
     )
     time.sleep(2.0)  # Let app setup.
@@ -844,20 +837,10 @@ class VlcApp(AppSetup):
       file_utils.mkdir(cls.videos_path, env.controller)
 
     time.sleep(2.0)
-    # Launch similar to opening app from app launcher. This runs setup logic not
-    # available using `adb shell am start`. Specifically, it will create the
-    # /data/data/org.videolan.vlc/app_db/vlc_media.db file.
-    adb_utils.issue_generic_request(
-        [
-            "shell",
-            "monkey",
-            "-p",
-            package,
-            "-candroid.intent.category.LAUNCHER",
-            "1",
-        ],
-        env.controller,
-    )
+    # Launch similar to opening app from app launcher. Uses am start (not
+    # monkey) to avoid the auto-rotate bug; launcher activity resolution still
+    # yields the same startup path that creates vlc_media.db.
+    adb_utils.launch_app_by_package(package, env.controller)
     time.sleep(2.0)
     try:
       controller = tools.AndroidToolController(env=env.controller)
@@ -922,18 +905,8 @@ class JoplinApp(AppSetup):
         env.controller,
     )
 
-    # Launch the app, similar to how user launches it from App Drawer.
-    adb_utils.issue_generic_request(
-        [
-            "shell",
-            "monkey",
-            "-p",
-            joplin_package,
-            "-candroid.intent.category.LAUNCHER",
-            "1",
-        ],
-        env.controller,
-    )
+    # Launch the app via am start (not monkey) to avoid auto-rotate bug.
+    adb_utils.launch_app_by_package(joplin_package, env.controller)
     time.sleep(10.0)
     adb_utils.close_app(cls.app_name, env.controller)
     time.sleep(10.0)
