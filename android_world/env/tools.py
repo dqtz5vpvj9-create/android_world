@@ -16,13 +16,67 @@
 
 import inspect
 import json
+import re
 import time
+import xml.etree.ElementTree as _ET
 from typing import Optional, Union
 
+from absl import logging as _logging
 from android_world.env import actuation
 from android_world.env import adb_utils
 from android_world.env import android_world_controller
 from android_world.utils import contacts_utils
+
+
+def _uiautomator_click_text(target_text: str, env, case_sensitive: bool = False) -> bool:
+  """Fallback click via system uiautomator dump + input tap.
+
+  Used when the droidbot-backed view tree (from
+  AndroidWorldController.get_ui_elements) misses an element that the system
+  accessibility tree actually has — typically ImageButton with content-desc
+  but text="" (e.g. Markor wizard ">" arrow), or transient elements droidbot
+  filters as invisible during animation. uiautomator dumps directly from the
+  framework AccessibilityNodeInfo tree.
+
+  Returns True if a matching element was found and tapped, False otherwise.
+  """
+  target = target_text if case_sensitive else target_text.lower()
+  try:
+    adb_utils.issue_generic_request(
+        ['shell', 'uiautomator', 'dump', '/sdcard/_aw_click_dump.xml'], env,
+    )
+    resp = adb_utils.issue_generic_request(
+        ['shell', 'cat', '/sdcard/_aw_click_dump.xml'], env,
+    )
+    xml_str = resp.generic.output.decode('utf-8', errors='replace')
+    root = _ET.fromstring(xml_str)
+    for node in root.iter('node'):
+      txt = node.get('text') or ''
+      cd = node.get('content-desc') or ''
+      if not case_sensitive:
+        txt = txt.lower()
+        cd = cd.lower()
+      if txt != target and cd != target:
+        continue
+      bounds = node.get('bounds') or ''
+      m = re.match(r'\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]', bounds)
+      if not m:
+        continue
+      x1, y1, x2, y2 = map(int, m.groups())
+      cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+      adb_utils.issue_generic_request(
+          ['shell', 'input', 'tap', str(cx), str(cy)], env,
+      )
+      _logging.info(
+          "click_element[uiautomator-fallback]: tapped %r at (%d,%d)",
+          target_text, cx, cy,
+      )
+      return True
+  except Exception as e:
+    _logging.warning(
+        "click_element[uiautomator-fallback] errored on %r: %s", target_text, e,
+    )
+  return False
 
 
 # When the compose message is pulled up, the send button has this as text for
@@ -47,7 +101,22 @@ class AndroidToolController:
     self._env = env
 
   def click_element(self, element_text: str):
-    actuation.find_and_click_element(element_text, self._env)
+    """Click a UI element by visible text or content-description.
+
+    Fast path: actuation.find_and_click_element via droidbot accessibility
+    tree. On real devices, droidbot's ``exclude_invisible_elements=True``
+    filter occasionally hides ImageButton/animation-transient elements that
+    the system accessibility tree actually has — fall back to a uiautomator
+    dump + ``input tap`` by element bounds (covers content-desc matches the
+    droidbot tree may have dropped).
+    """
+    try:
+      actuation.find_and_click_element(element_text, self._env)
+      return
+    except ValueError:
+      if _uiautomator_click_text(element_text, self._env):
+        return
+      raise
 
   def open_web_page(self, url: str):
     """Open a web page in the default browser on an Android device.

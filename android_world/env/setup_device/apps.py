@@ -21,7 +21,9 @@ Interface.
 
 import abc
 import os
+import re
 import time
+import xml.etree.ElementTree as _ET
 from typing import Iterable
 from absl import logging
 from android_world.env import adb_utils
@@ -30,6 +32,71 @@ from android_world.env import tools
 from android_world.task_evals.information_retrieval import joplin_app_utils
 from android_world.utils import file_utils
 import requests
+
+
+def _resilient_click_text(controller, target_text: str, env) -> bool:
+  """Click an onboarding button by visible text — with a uiautomator fallback.
+
+  CVD vs real-device first-launch state machines diverge:
+    - CVD often renders the wizard button as a Button widget with text="NEXT"
+    - Real devices may render it as an ImageButton with content-desc="NEXT"
+      (e.g. Markor) or have other visibility quirks that make droidbot's
+      accessibility view tree miss it during cold start.
+
+  Fast path: AndroidToolController.click_element (droidbot tree). On
+  ValueError, fall back to a system-level uiautomator dump and tap by
+  bounds — uiautomator reads from the framework's accessibility service
+  directly, so it sees content-desc and elements droidbot may have
+  filtered as invisible.
+
+  Returns True if a click was issued, False if neither path found the
+  target (caller decides whether that's fatal or "wizard already done").
+  """
+  try:
+    controller.click_element(target_text)
+    return True
+  except ValueError:
+    pass
+
+  try:
+    # Dump UI hierarchy via the system uiautomator (not droidbot).
+    adb_utils.issue_generic_request(
+        ['shell', 'uiautomator', 'dump', '/sdcard/_aw_setup_dump.xml'], env,
+    )
+    resp = adb_utils.issue_generic_request(
+        ['shell', 'cat', '/sdcard/_aw_setup_dump.xml'], env,
+    )
+    xml_str = resp.generic.output.decode('utf-8', errors='replace')
+    root = _ET.fromstring(xml_str)
+    target_lower = target_text.lower()
+    for node in root.iter('node'):
+      txt = (node.get('text') or '').lower()
+      cd = (node.get('content-desc') or '').lower()
+      if txt != target_lower and cd != target_lower:
+        continue
+      bounds = node.get('bounds') or ''
+      m = re.match(r'\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]', bounds)
+      if not m:
+        continue
+      x1, y1, x2, y2 = map(int, m.groups())
+      cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+      adb_utils.issue_generic_request(
+          ['shell', 'input', 'tap', str(cx), str(cy)], env,
+      )
+      logging.info(
+          "_resilient_click_text: uiautomator-fallback tapped %r at (%d,%d)",
+          target_text, cx, cy,
+      )
+      return True
+    logging.info(
+        "_resilient_click_text: %r not in droidbot OR uiautomator tree;"
+        " assuming the wizard branch is absent on this device.",
+        target_text,
+    )
+    return False
+  except Exception as e:
+    logging.warning("_resilient_click_text fallback errored: %s", e)
+    return False
 
 
 APP_DATA = file_utils.convert_to_posix_path(os.path.dirname(__file__),
@@ -203,7 +270,10 @@ class CameraApp(AppSetup):
     try:
       controller = tools.AndroidToolController(env=env.controller)
       time.sleep(2.0)
-      controller.click_element("NEXT")
+      # CVD camera: text="NEXT" Button. Real-device variants may render
+      # the same wizard with different widgets; resilient_click handles
+      # both via uiautomator fallback.
+      _resilient_click_text(controller, "NEXT", env.controller)
       time.sleep(2.0)
     finally:
       adb_utils.close_app(cls.app_name, env.controller)
@@ -368,26 +438,19 @@ class MarkorApp(AppSetup):
       time.sleep(2.0)
 
       # Onboarding wizard: navigate through pages until DONE appears.
-      # Normally 4 NEXT presses, but UI page-transition animations may
-      # swallow a click, so we keep pressing NEXT until it disappears
-      # rather than relying on an exact count.
+      # CVD: text="NEXT" Button. Real device: ImageButton with
+      # content-desc="NEXT" (id=net.gsantner.markor:id/next), often
+      # missed by droidbot's tree → resilient_click hits it via
+      # uiautomator fallback.
       max_next = 8  # safety cap (normally 4)
       for _ in range(max_next):
-        try:
-          controller.click_element("NEXT")
-          time.sleep(2.0)
-        except ValueError:
-          # NEXT no longer on screen → should be on final DONE page
+        if not _resilient_click_text(controller, "NEXT", env.controller):
+          # NEXT no longer present → likely on the final DONE page.
           break
-
-      # Click DONE; if it fails, maybe one more NEXT was needed.
-      try:
-        controller.click_element("DONE")
-      except ValueError:
-        # Retry: click NEXT once more, then DONE
-        controller.click_element("NEXT")
         time.sleep(2.0)
-        controller.click_element("DONE")
+
+      # Final page: DONE button (text or content-desc).
+      _resilient_click_text(controller, "DONE", env.controller)
       time.sleep(2.0)
 
       # Permission dialogs — may not appear if already granted.
@@ -659,9 +722,15 @@ class ExpenseApp(AppSetup):
     try:
       time.sleep(2.0)
       controller = tools.AndroidToolController(env=env.controller)
-      controller.click_element("NEXT")
+      # Pro Expense onboarding: language picker → currency picker.
+      # Real-device renders a Button with text="NEXT" + Button id=btn_continue.
+      # Both pages use the same button; the second page label varies by
+      # build (NEXT or CONTINUE), so try both via resilient_click.
+      _resilient_click_text(controller, "NEXT", env.controller)
       time.sleep(2.0)
-      controller.click_element("CONTINUE")
+      if not _resilient_click_text(controller, "CONTINUE", env.controller):
+        # Some builds keep the label "NEXT" on page 2.
+        _resilient_click_text(controller, "NEXT", env.controller)
       time.sleep(3.0)
     finally:
       adb_utils.close_app(cls.app_name, env.controller)
