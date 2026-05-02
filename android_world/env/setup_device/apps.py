@@ -982,15 +982,40 @@ class JoplinApp(AppSetup):
 
     # Calling clear_dbs() without having added a note seems to make
     # the sqlite table inaccessible. Every subsequent call to clear_dbs()
-    # works fine.
-    joplin_app_utils.create_note(
-        folder="new folder",
-        title="new_note",
-        body="",
-        folder_mapping={},
-        env=env,
-    )
-    joplin_app_utils.clear_dbs(env)
+    # works fine. On freshly reinstalled CVDs the first DB write can still
+    # race Joplin's lazy SQLite initialization, so retry the warm-up sequence
+    # before failing the whole app setup.
+    last_error = None
+    for attempt in range(1, 4):
+      try:
+        joplin_app_utils.create_note(
+            folder="new folder",
+            title="new_note",
+            body="",
+            folder_mapping={},
+            env=env,
+        )
+        joplin_app_utils.clear_dbs(env)
+        last_error = None
+        break
+      except Exception as e:  # pylint: disable=broad-exception-caught
+        last_error = e
+        logging.warning(
+            "JoplinApp: DB warm-up attempt %d/3 failed: %s", attempt, e
+        )
+        if attempt == 3:
+          break
+        try:
+          adb_utils.launch_app_by_package(joplin_package, env.controller)
+          time.sleep(10.0)
+          adb_utils.close_app(cls.app_name, env.controller)
+        except Exception as warmup_error:  # pylint: disable=broad-exception-caught
+          logging.warning(
+              "JoplinApp: DB warm-up relaunch failed: %s", warmup_error
+          )
+        time.sleep(3.0)
+    if last_error is not None:
+      raise last_error
 
 
 class RetroMusicApp(AppSetup):
