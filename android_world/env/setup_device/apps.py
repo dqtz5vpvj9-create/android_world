@@ -26,6 +26,7 @@ import time
 import xml.etree.ElementTree as _ET
 from typing import Iterable
 from absl import logging
+from android_env.proto import adb_pb2
 from android_world.env import adb_utils
 from android_world.env import interface
 from android_world.env import tools
@@ -794,6 +795,43 @@ class OsmAndApp(AppSetup):
   app_name = "osmand"
 
   @classmethod
+  def _set_map_security_context(
+      cls, map_path: str, env: interface.AsyncEnv
+  ) -> None:
+    response = adb_utils.issue_generic_request(
+        [
+            "shell",
+            "chcon",
+            "u:object_r:media_rw_data_file:s0",
+            map_path,
+        ],
+        env.controller,
+    )
+    if response.status == adb_pb2.AdbResponse.Status.OK:
+      return
+
+    output = []
+    if response.HasField("generic"):
+      output.append(response.generic.output.decode("utf-8", errors="replace"))
+    if response.error_message:
+      output.append(response.error_message)
+    message = "\n".join(part.strip() for part in output if part.strip())
+
+    if (
+        "Operation not supported on transport endpoint" in message
+        and file_utils.check_file_exists(map_path, env.controller)
+    ):
+      logging.warning(
+          "Skipping OsmAnd map chcon on FUSE-backed external storage: %s",
+          map_path,
+      )
+      return
+
+    if message:
+      raise RuntimeError(f"Failed to chcon {map_path}: {message}")
+    adb_utils.check_ok(response)
+
+  @classmethod
   def setup(cls, env: interface.AsyncEnv) -> None:
     super().setup(env)
     adb_utils.launch_app(cls.app_name, env.controller)
@@ -822,18 +860,9 @@ class OsmAndApp(AppSetup):
 
     # Make sure security context is correct so that the files can be accessed.
     for map_file in cls.MAP_NAMES:
-      adb_utils.check_ok(
-          adb_utils.issue_generic_request(
-              [
-                  "shell",
-                  "chcon",
-                  "u:object_r:media_rw_data_file:s0",
-                  file_utils.convert_to_posix_path(
-                      cls.DEVICE_MAPS_PATH, map_file
-                  ),
-              ],
-              env.controller,
-          )
+      cls._set_map_security_context(
+          file_utils.convert_to_posix_path(cls.DEVICE_MAPS_PATH, map_file),
+          env,
       )
 
     adb_utils.close_app(cls.app_name, env.controller)
