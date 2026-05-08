@@ -146,8 +146,11 @@ def maybe_install_app(
   logging.info("Installing app: %s.", app.app_name)
 
   apk_installed = False
+  apk_prerequisites = getattr(app, "apk_prerequisites", {})
   for apk_name in app.apk_names:
     try:
+      for prerequisite in apk_prerequisites.get(apk_name, ()):
+        download_and_install_apk(prerequisite, env.controller.env)
       download_and_install_apk(apk_name, env.controller.env)
       apk_installed = True
       break

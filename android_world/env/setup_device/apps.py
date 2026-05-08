@@ -286,12 +286,20 @@ class ChromeApp(AppSetup):
   Originally assumed pre-installed, but Cuttlefish (CVD) emulators lack GMS
   and therefore do not ship Chrome.  We provide APKs for both arm64 and
   x86_64 architectures so setup_app_native can install the correct one.
+  Pixel 9 / tokay is arm64-only, so it needs a Chrome build whose static
+  Trichrome library is installed before the Chrome APK.
   """
 
   apk_names = (
+      "com.android.chrome_134_arm64.apk",
       "com.android.chrome_arm64.apk",
       "com.android.chrome_x86_64.apk",
   )
+  apk_prerequisites = {
+      "com.android.chrome_134_arm64.apk": (
+          "com.google.android.trichromelibrary_134_arm64.apk",
+      ),
+  }
   app_name = "chrome"
 
   @classmethod
