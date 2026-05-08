@@ -27,14 +27,70 @@ from android_world.utils import contacts_utils
 class TestContactsUtils(absltest.TestCase):
 
   def test_add_contact(self, mock_click_element, mock_generic_request):
-    """Test adding a contact."""
+    """Test adding a contact through ContactsProvider."""
     mock_env = mock.create_autospec(env_interface.AndroidEnvInterface)
+    ok = adb_pb2.AdbResponse()
+    ok.status = adb_pb2.AdbResponse.Status.OK
+    query = adb_pb2.AdbResponse()
+    query.status = adb_pb2.AdbResponse.Status.OK
+    query.generic.output = b"Row: 0 _id=7"
+    mock_generic_request.side_effect = [ok, query, ok, ok]
 
     phone_number = "+123456789"
     name = "Emma Watson"
     contacts_utils.add_contact(name, phone_number, mock_env)
 
-    # Construct the expected adb command
+    mock_generic_request.assert_has_calls([
+        mock.call([
+            "shell",
+            (
+                "content insert --uri content://com.android.contacts/raw_contacts"
+                " --bind account_type:s:local --bind account_name:s:local"
+            ),
+        ], mock_env),
+        mock.call([
+            "shell",
+            (
+                "content query --uri content://com.android.contacts/raw_contacts"
+                ' --projection _id --sort "_id DESC"'
+            ),
+        ], mock_env),
+        mock.call([
+            "shell",
+            (
+                "content insert --uri content://com.android.contacts/data"
+                " --bind raw_contact_id:i:7"
+                " --bind mimetype:s:vnd.android.cursor.item/name"
+                " --bind data1:s:'Emma Watson'"
+            ),
+        ], mock_env),
+        mock.call([
+            "shell",
+            (
+                "content insert --uri content://com.android.contacts/data"
+                " --bind raw_contact_id:i:7"
+                " --bind mimetype:s:vnd.android.cursor.item/phone_v2"
+                " --bind data1:s:+123456789 --bind data2:i:2"
+            ),
+        ], mock_env),
+    ])
+    mock_click_element.assert_not_called()
+
+  def test_add_contact_falls_back_to_ui(
+      self, mock_click_element, mock_generic_request
+  ):
+    """Falls back to the legacy Contacts UI when provider insertion fails."""
+    mock_env = mock.create_autospec(env_interface.AndroidEnvInterface)
+    failed = adb_pb2.AdbResponse()
+    failed.status = adb_pb2.AdbResponse.Status.INTERNAL_ERROR
+    ok = adb_pb2.AdbResponse()
+    ok.status = adb_pb2.AdbResponse.Status.OK
+    mock_generic_request.side_effect = [failed, ok]
+
+    phone_number = "+123456789"
+    name = "Emma Watson"
+    contacts_utils.add_contact(name, phone_number, mock_env)
+
     expected_adb_command = [
         "shell",
         (
@@ -43,20 +99,17 @@ class TestContactsUtils(absltest.TestCase):
             f" {phone_number}"
         ),
     ]
-
-    # Assert that the correct adb command was issued
-    mock_generic_request.assert_called_once_with(expected_adb_command, mock_env)
-
-    # Assert that the _click_element method was called with the correct argument
+    self.assertIn(mock.call(expected_adb_command, mock_env),
+                  mock_generic_request.mock_calls)
     mock_click_element.assert_called_once_with("SAVE", mock_env)
 
   def test_list_contacts(self, unused_mock_click_element, mock_generic_request):
-    """Test listing all contacts."""
+    """Test listing contacts from the modern phone data URI."""
     mock_env = mock.create_autospec(env_interface.AndroidEnvInterface)
     adb_response = adb_pb2.AdbResponse()
     adb_response.generic.output = """
-      Row: 0 display_name=Jane Doe, number=1 (234) 567-89
-      Row: 0 display_name=Chen, number=98765
+      Row: 0 display_name=Jane Doe, data1=1 (234) 567-89
+      Row: 0 display_name=Chen, data1=98765
     """.encode("utf-8")
     mock_generic_request.return_value = adb_response
 
@@ -70,17 +123,38 @@ class TestContactsUtils(absltest.TestCase):
         ],
     )
 
-    # Construct the expected adb command
     expected_adb_command = [
         "shell",
         (
-            "content query --uri content://contacts/phones/ --projection"
-            " display_name:number"
+            "content query --uri content://com.android.contacts/data/phones"
+            " --projection display_name:data1"
         ),
     ]
-
-    # Assert that the correct adb command was issued
     mock_generic_request.assert_called_once_with(expected_adb_command, mock_env)
+
+  def test_list_contacts_falls_back_to_legacy_uri(
+      self, unused_mock_click_element, mock_generic_request
+  ):
+    """Falls back to the legacy phone URI when the modern URI is empty."""
+    mock_env = mock.create_autospec(env_interface.AndroidEnvInterface)
+    empty = adb_pb2.AdbResponse()
+    empty.generic.output = b"No result found."
+    legacy = adb_pb2.AdbResponse()
+    legacy.generic.output = """
+      Row: 0 display_name=Jane Doe, number=1 (234) 567-89
+      Row: 0 display_name=Chen, number=98765
+    """.encode("utf-8")
+    mock_generic_request.side_effect = [empty, legacy]
+
+    contacts = contacts_utils.list_contacts(mock_env)
+
+    self.assertEqual(
+        contacts,
+        [
+            contacts_utils.Contact("Jane Doe", "123456789"),
+            contacts_utils.Contact("Chen", "98765"),
+        ],
+    )
 
   def test_clear_contacts(
       self, unused_mock_click_element, mock_generic_request

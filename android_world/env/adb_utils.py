@@ -32,6 +32,11 @@ import immutabledict
 T = TypeVar('T')
 
 _DEFAULT_TIMEOUT_SECS = 10
+_CLOSE_RECENTS_SKIP_PACKAGES_ENV = 'ANDROID_WORLD_CLOSE_RECENTS_SKIP_PACKAGES'
+_RECENT_TASK_BLOCK_RE = re.compile(
+    r'(?ms)^\s*\*\s+(?:RecentTaskInfo|Recent)\s+#\d+:(.*?)'
+    r'(?=^\s*\*\s+(?:RecentTaskInfo|Recent)\s+#\d+:|\Z)'
+)
 
 # pylint: disable=line-too-long
 # Maps app names to the activity that should be launched to open the app.
@@ -782,12 +787,78 @@ def extract_package_name(activity: str) -> str:
   return activity.split('/')[0]
 
 
+def _close_recents_skip_packages() -> set[str]:
+  raw = os.environ.get(_CLOSE_RECENTS_SKIP_PACKAGES_ENV, '')
+  if not raw.strip():
+    return set()
+  values = None
+  try:
+    decoded = json.loads(raw)
+    if isinstance(decoded, str):
+      values = [decoded]
+    elif isinstance(decoded, (list, tuple, set)):
+      values = decoded
+  except json.JSONDecodeError:
+    values = None
+  if values is None:
+    values = raw.replace(',', '\n').splitlines()
+  return {str(value).strip() for value in values if str(value).strip()}
+
+
+def _recents_ids_to_close(
+    recents_output: str, skip_packages: set[str]
+) -> list[str]:
+  if not skip_packages:
+    return re.findall(r'\bid=(\d+)\b', recents_output)
+
+  ids_to_close = []
+  blocks = _RECENT_TASK_BLOCK_RE.findall(recents_output)
+  for block in blocks:
+    if 'type=home' in block or 'activityType=2' in block:
+      continue
+    task_id = None
+    for pattern in (
+        r'\bid=(\d+)\b',
+        r'\btaskId=(\d+)\b',
+        r'Task\{[^#\n]*#(\d+)\b',
+    ):
+      match = re.search(pattern, block)
+      if match:
+        task_id = match.group(1)
+        break
+    if task_id is None:
+      continue
+    if any(package in block for package in skip_packages):
+      logging.info(
+          'Skipping recent task %s because it matches %s=%s.',
+          task_id,
+          _CLOSE_RECENTS_SKIP_PACKAGES_ENV,
+          sorted(skip_packages),
+      )
+      continue
+    ids_to_close.append(task_id)
+
+  if blocks:
+    return ids_to_close
+
+  logging.warning(
+      '%s is set, but dumpsys activity recents did not contain parseable '
+      'RecentTaskInfo blocks; leaving recents untouched to avoid killing the '
+      'protected foreground workload.',
+      _CLOSE_RECENTS_SKIP_PACKAGES_ENV,
+  )
+  return []
+
+
 def close_recents(env: env_interface.AndroidEnvInterface):
   """Closes all recent apps."""
   response = issue_generic_request('shell dumpsys activity recents', env)
   if response.status != adb_pb2.AdbResponse.Status.OK:
     return
-  recents_ids = re.findall(r'id=(\d+)', response.generic.output.decode())
+  recents_output = response.generic.output.decode(errors='replace')
+  recents_ids = _recents_ids_to_close(
+      recents_output, _close_recents_skip_packages()
+  )
   for recents_id in recents_ids:
     issue_generic_request(['shell', 'am', 'stack', 'remove', recents_id], env)
 

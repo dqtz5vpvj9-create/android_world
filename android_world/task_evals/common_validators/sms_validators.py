@@ -176,8 +176,13 @@ def sms_are_equal(message1: str, message2: str) -> bool:
 def clear_sms_and_threads(env: env_interface.AndroidEnvInterface) -> None:
   """Removes all messages from UI by clearing the sms and threads tables."""
   db_path = "/data/data/com.android.providers.telephony/databases/mmssms.db"
-  adb_utils.execute_sql_command(db_path, "DELETE FROM sms;", env)
-  adb_utils.execute_sql_command(db_path, "DELETE FROM threads;", env)
+  # Android 14's sqlite rejects the Telephony provider's FTS trigger on `sms`
+  # unless trusted_schema is enabled for this connection.
+  for table in ("sms", "threads"):
+    response = adb_utils.execute_sql_command(
+        db_path, f"PRAGMA trusted_schema=ON; DELETE FROM {table};", env
+    )
+    adb_utils.check_ok(response)
 
 
 class SimpleSMSSendSms(task_eval.TaskEval):

@@ -54,6 +54,12 @@ def get_font(size: int | float) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
 
 
 _TMP = file_utils.get_local_tmp_directory()
+_PROTECTED_INTERNAL_STORAGE_PREFIXES_ENV = "ANDROID_WORLD_PROTECTED_STORAGE_PREFIXES"
+_PROTECTED_INTERNAL_STORAGE_PREFIXES = (
+    # Foreground workloads may keep large DLC under app-specific external
+    # storage. Do not let AndroidWorld's broad storage reset delete it.
+    "/storage/emulated/0/Android/data/com.futuremark.dmandroid.application",
+)
 
 
 def generate_random_string(length: int) -> str:
@@ -455,18 +461,54 @@ def _draw_text(text: str, font_size: int = 24) -> Image.Image:
   return img
 
 
-def clear_internal_storage(env: interface.AsyncEnv) -> None:
-  """Deletes all files from internal storage, leaving directory structure intact."""
+def _protected_internal_storage_prefixes() -> list[str]:
+  prefixes = list(_PROTECTED_INTERNAL_STORAGE_PREFIXES)
+  for raw in os.environ.get(_PROTECTED_INTERNAL_STORAGE_PREFIXES_ENV, "").split(
+      os.pathsep
+  ):
+    path = raw.strip().rstrip("/")
+    if path and path not in prefixes:
+      prefixes.append(path)
+  return prefixes
+
+
+def _clear_internal_storage_adb_command(
+    root: str = device_constants.EMULATOR_DATA,
+) -> list[str]:
+  root = root.rstrip("/") or root
+  protected = [
+      path
+      for path in _protected_internal_storage_prefixes()
+      if path == root or path.startswith(f"{root}/")
+  ]
   adb_command = [
       "shell",
       "find",
-      device_constants.EMULATOR_DATA,
+      root,
       "-mindepth",
       "1",
+  ]
+  if protected:
+    adb_command.append(r"\(")
+    for index, path in enumerate(protected):
+      if index:
+        adb_command.append("-o")
+      # AutoDroid's lightweight ADB controller joins list-form shell args into
+      # one remote shell command. Escape the wildcard so the device shell does
+      # not expand it before `find` evaluates the protected prefix.
+      adb_command.extend(["-path", path, "-o", "-path", f"{path}/\\*"])
+    adb_command.extend([r"\)", "-prune", "-o"])
+  adb_command.extend([
       "-type",
       "f",  # Regular file.
       "-delete",
-  ]
+  ])
+  return adb_command
+
+
+def clear_internal_storage(env: interface.AsyncEnv) -> None:
+  """Deletes internal-storage files while preserving protected app data."""
+  adb_command = _clear_internal_storage_adb_command()
   adb_utils.issue_generic_request(adb_command, env.controller)
 
 

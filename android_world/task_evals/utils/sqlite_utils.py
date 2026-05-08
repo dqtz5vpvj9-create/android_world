@@ -66,6 +66,21 @@ if not _HAS_FTS:
         )
 
 
+def _remote_file_exists_on_device(
+    remote_file_path: str,
+    env: interface.AsyncEnv,
+    timeout_sec: Optional[float] = None,
+) -> bool:
+    """Return whether a remote file exists without creating it.
+
+    Running `sqlite3 /path/to/missing.db ...` creates an empty database file.
+    The setup path calls the row reader while waiting for first-launch app DBs,
+    so we must check existence with `test -f` before any SQLite command.
+    """
+    del timeout_sec
+    return file_utils.check_file_exists(remote_file_path, env.controller)
+
+
 def _checkpoint_wal_on_device(
     remote_db_file_path: str,
     env: interface.AsyncEnv,
@@ -87,6 +102,24 @@ def _checkpoint_wal_on_device(
     Returns:
         True 表示 checkpoint 成功，False 表示失败（设备无 sqlite3 等）。
     """
+    # VLC libmedialibrary 的 trigger 用 SQLite 3.33 的 UPDATE…FROM 语法，
+    # AOSP13 自带 sqlite3 3.32.2 解析不了，必然报
+    # "malformed database schema … near FROM: syntax error"。
+    # 走 host 路径（pull_file → Python sqlite ≥3.40）能正常处理，
+    # 这里直接短路避免设备端 stderr 被 agent 当成真错误读到。
+    if "org.videolan.vlc/" in remote_db_file_path:
+        logger.debug(
+            "跳过设备端 WAL checkpoint（VLC schema 与 AOSP13 sqlite3 不兼容，"
+            "改走 host）: %s", remote_db_file_path,
+        )
+        return False
+    if not _remote_file_exists_on_device(remote_db_file_path, env, timeout_sec):
+        logger.debug(
+            "跳过设备端 WAL checkpoint: DB 尚不存在，避免 sqlite3 创建空库: %s",
+            remote_db_file_path,
+        )
+        return False
+
     try:
         response = adb_utils.issue_generic_request(
             ['shell', 'sqlite3', remote_db_file_path,

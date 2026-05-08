@@ -14,6 +14,7 @@
 
 """Tests for adb_utils."""
 
+import os
 from unittest import mock
 
 from absl.testing import absltest
@@ -36,6 +37,74 @@ class AdbTestSetup(absltest.TestCase):
   def tearDown(self):
     super().tearDown()
     mock.patch.stopall()
+
+
+class CloseRecentsTest(AdbTestSetup):
+
+  _RECENTS_OUTPUT = """Recent tasks:
+  * RecentTaskInfo #0:
+    id=101 userId=0
+    baseActivity={com.android.benchmark/com.android.benchmark.ui.ForegroundWorkloadActivity}
+    topActivity={com.android.benchmark/com.android.benchmark.ui.ForegroundWorkloadActivity}
+  * RecentTaskInfo #1:
+    id=102 userId=0
+    baseActivity={com.simplemobiletools.calendar.pro/.activities.MainActivity}
+    topActivity={com.simplemobiletools.calendar.pro/.activities.MainActivity}
+"""
+  _AOSP13_RECENTS_OUTPUT = """ACTIVITY MANAGER RECENT TASKS (dumpsys activity recents)
+mRecentsUid=10075
+  Recent tasks:
+  * Recent #0: Task{2b1a9d #6 type=home I=com.android.launcher3/.uioverrides.QuickstepLauncher}
+    userId=0 effectiveUid=u0a75
+    taskId=6 rootTaskId=1
+  * Recent #1: Task{12ab34 #177 type=standard A=10095:com.android.benchmark}
+    userId=0 effectiveUid=u0a95
+    intent={cmp=com.android.benchmark/.ui.ForegroundWorkloadActivity}
+    taskId=177 rootTaskId=177
+  * Recent #2: Task{56cd78 #178 type=standard A=10128:com.simplemobiletools.calendar.pro}
+    userId=0 effectiveUid=u0a128
+    intent={cmp=com.simplemobiletools.calendar.pro/.activities.MainActivity}
+    taskId=178 rootTaskId=178
+"""
+
+  def test_recents_ids_to_close_without_skip_packages_preserves_old_scan(self):
+    self.assertEqual(
+        adb_utils._recents_ids_to_close(self._RECENTS_OUTPUT, set()),
+        ['101', '102'],
+    )
+
+  def test_recents_ids_to_close_skips_matching_package_block(self):
+    self.assertEqual(
+        adb_utils._recents_ids_to_close(
+            self._RECENTS_OUTPUT, {'com.android.benchmark'}
+        ),
+        ['102'],
+    )
+
+  def test_recents_ids_to_close_skips_aosp13_recent_task_format(self):
+    self.assertEqual(
+        adb_utils._recents_ids_to_close(
+            self._AOSP13_RECENTS_OUTPUT, {'com.android.benchmark'}
+        ),
+        ['178'],
+    )
+
+  def test_close_recents_uses_skip_package_environment(self):
+    response = adb_pb2.AdbResponse()
+    response.status = adb_pb2.AdbResponse.Status.OK
+    response.generic.output = self._RECENTS_OUTPUT.encode('utf-8')
+    self.mock_issue_generic_request.return_value = response
+
+    with mock.patch.dict(
+        os.environ,
+        {'ANDROID_WORLD_CLOSE_RECENTS_SKIP_PACKAGES': '["com.android.benchmark"]'},
+    ):
+      adb_utils.close_recents(self.mock_env)
+
+    self.mock_issue_generic_request.assert_has_calls([
+        mock.call('shell dumpsys activity recents', self.mock_env),
+        mock.call(['shell', 'am', 'stack', 'remove', '102'], self.mock_env),
+    ])
 
 
 class PhoneUtilsTest(AdbTestSetup):

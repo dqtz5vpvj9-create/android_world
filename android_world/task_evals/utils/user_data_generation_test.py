@@ -60,5 +60,20 @@ class TestCreateMpegWithMessages(absltest.TestCase):
     self.assertEqual(total_frames, 300)
 
 
+class TestClearInternalStorageCommand(absltest.TestCase):
+
+  def test_escapes_protected_prefix_wildcard(self):
+    command = user_data_generation._clear_internal_storage_adb_command()
+
+    protected_prefix = (
+        "/storage/emulated/0/Android/data/"
+        "com.futuremark.dmandroid.application"
+    )
+    self.assertIn("-prune", command)
+    self.assertIn(protected_prefix, command)
+    self.assertIn(f"{protected_prefix}/\\*", command)
+    self.assertNotIn(f"{protected_prefix}/*", command)
+
+
 if __name__ == "__main__":
   absltest.main()
